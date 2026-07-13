@@ -30,6 +30,18 @@ const NAMESPACE = 'copilot-chat';
 export type TelemetryProps = Record<string, string | undefined>;
 export type TelemetryMeasurements = Record<string, number | undefined>;
 
+export interface IAgentHostInternalTelemetryContext {
+	readonly isInternal: boolean;
+	readonly trackingId: string | undefined;
+	readonly userName: string | undefined;
+	readonly isVscodeTeamMember: boolean;
+}
+
+export interface IAgentHostInternalTelemetrySink {
+	setContext(context: IAgentHostInternalTelemetryContext | undefined): void;
+	send(eventName: string, properties?: TelemetryProps, measurements?: TelemetryMeasurements): void;
+}
+
 /** The subset of the global `fetch` used to POST envelopes; injectable so tests avoid live network calls. */
 export type FetchFn = typeof globalThis.fetch;
 
@@ -86,6 +98,8 @@ export interface IAgentHostRestrictedTelemetry {
 	setRestrictedTelemetryEndpoint(endpointUrl: string | undefined): void;
 	/** Enables enhanced GH telemetry once the token opts in (`rt=1`); off by default and on flip/logout. */
 	setRestrictedTelemetryEnabled(enabled: boolean): void;
+	/** Sets the internal-user identity and enables the internal sink only for staff accounts. */
+	setInternalTelemetryContext(context: IAgentHostInternalTelemetryContext | undefined): void;
 }
 
 /**
@@ -104,12 +118,13 @@ export class AgentHostRestrictedTelemetrySender implements IAgentHostRestrictedT
 	 * Copilot extension, which only creates the restricted reporter for opted-in users.
 	 */
 	private _restrictedTelemetryEnabled = false;
+	private _internalTelemetryEnabled = false;
 
 	constructor(
 		commonProperties: ICommonProperties,
 		private readonly _logService: ILogService,
 		private _endpointUrl: string = GH_TELEMETRY_URL,
-		private readonly _internalSink?: (eventName: string, properties?: TelemetryProps, measurements?: TelemetryMeasurements) => void,
+		private readonly _internalSink?: IAgentHostInternalTelemetrySink,
 		private readonly _fetchFn: FetchFn = globalThis.fetch,
 	) {
 		// Map the resolved common properties onto the GH property names the hydro schema reads.
@@ -138,11 +153,11 @@ export class AgentHostRestrictedTelemetrySender implements IAgentHostRestrictedT
 	}
 
 	sendInternalMSFTTelemetryEvent(eventName: string, properties?: TelemetryProps, measurements?: TelemetryMeasurements): void {
-		// Internal MSFT telemetry lands in the Aria/Collector++ pipeline via a dedicated key,
-		// which is not present in the agent-host product config. Route to the optional sink when
-		// wired; otherwise trace so the event is at least visible in the agent-host log.
+		if (!this._internalTelemetryEnabled) {
+			return;
+		}
 		if (this._internalSink) {
-			this._internalSink(eventName, properties, measurements);
+			this._internalSink.send(eventName, properties, measurements);
 			return;
 		}
 		this._logService.trace(`[ahp-restricted] internal MSFT event (not sent, no internal key): ${eventName}`);
@@ -163,6 +178,11 @@ export class AgentHostRestrictedTelemetrySender implements IAgentHostRestrictedT
 
 	setRestrictedTelemetryEnabled(enabled: boolean): void {
 		this._restrictedTelemetryEnabled = enabled;
+	}
+
+	setInternalTelemetryContext(context: IAgentHostInternalTelemetryContext | undefined): void {
+		this._internalTelemetryEnabled = context?.isInternal === true;
+		this._internalSink?.setContext(context);
 	}
 
 	private _post(iKey: string, eventName: string, properties?: TelemetryProps, measurements?: TelemetryMeasurements): void {

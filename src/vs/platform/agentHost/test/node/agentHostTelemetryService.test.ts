@@ -7,7 +7,7 @@ import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { ITelemetryData, ITelemetryService, TelemetryLevel } from '../../../telemetry/common/telemetry.js';
 import { AgentHostTelemetryLevelConfigKey, telemetryLevelToAgentHostConfigValue } from '../../common/agentHostSchema.js';
-import { IAgentHostRestrictedTelemetry, TelemetryProps } from '../../node/agentHostRestrictedTelemetry.js';
+import { IAgentHostRestrictedTelemetry, IAgentHostInternalTelemetryContext, TelemetryProps } from '../../node/agentHostRestrictedTelemetry.js';
 import { AgentHostTelemetryService, updateAgentHostTelemetryLevelFromConfig } from '../../node/agentHostTelemetryService.js';
 
 class TestTelemetryService implements ITelemetryService {
@@ -49,6 +49,8 @@ class TestRestrictedSink implements IAgentHostRestrictedTelemetry {
 	readonly trackingIds: (string | undefined)[] = [];
 	readonly endpoints: (string | undefined)[] = [];
 	readonly enabledFlags: boolean[] = [];
+	readonly internal: string[] = [];
+	readonly internalContexts: (IAgentHostInternalTelemetryContext | undefined)[] = [];
 
 	sendGHTelemetryEvent(eventName: string, _properties?: TelemetryProps): void {
 		this.standard.push(eventName);
@@ -56,7 +58,9 @@ class TestRestrictedSink implements IAgentHostRestrictedTelemetry {
 	sendEnhancedGHTelemetryEvent(eventName: string, _properties?: TelemetryProps): void {
 		this.enhanced.push(eventName);
 	}
-	sendInternalMSFTTelemetryEvent(): void { }
+	sendInternalMSFTTelemetryEvent(eventName: string): void {
+		this.internal.push(eventName);
+	}
 	setCopilotTrackingId(trackingId: string | undefined): void {
 		this.trackingIds.push(trackingId);
 	}
@@ -65,6 +69,9 @@ class TestRestrictedSink implements IAgentHostRestrictedTelemetry {
 	}
 	setRestrictedTelemetryEnabled(enabled: boolean): void {
 		this.enabledFlags.push(enabled);
+	}
+	setInternalTelemetryContext(context: IAgentHostInternalTelemetryContext | undefined): void {
+		this.internalContexts.push(context);
 	}
 }
 
@@ -154,5 +161,22 @@ suite('AgentHostTelemetryService', () => {
 
 		// Neither standard nor enhanced GH telemetry is delegated below USAGE, regardless of rt.
 		assert.deepStrictEqual({ enhanced: restricted.enhanced, standard: restricted.standard }, { enhanced: [], standard: [] });
+	});
+
+	test('internal telemetry is independently gated and identity is cleared on account changes', () => {
+		const restricted = new TestRestrictedSink();
+		const service = disposables.add(new AgentHostTelemetryService(new TestTelemetryService(), restricted));
+		const internalContext = { isInternal: true, trackingId: 'tid-1', userName: 'octocat', isVscodeTeamMember: true };
+
+		service.sendInternalMSFTTelemetryEvent('beforeIdentity');
+		service.setInternalTelemetryContext(internalContext);
+		service.sendInternalMSFTTelemetryEvent('internal');
+		service.setInternalTelemetryContext(undefined);
+		service.sendInternalMSFTTelemetryEvent('afterClear');
+
+		assert.deepStrictEqual({ internal: restricted.internal, contexts: restricted.internalContexts }, {
+			internal: ['internal'],
+			contexts: [internalContext, undefined],
+		});
 	});
 });

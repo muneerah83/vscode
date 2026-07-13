@@ -65,7 +65,8 @@ import { CopilotGitHubTelemetryForwarder } from './copilotGitHubTelemetryForward
 import { CopilotSessionLauncher, ContextSizeConfigKey, ThinkingLevelConfigKey, getCopilotContextTier, resolveCopilotReasoningEffort, type CopilotSessionLaunchPlan, type IActiveClientSnapshot } from './copilotSessionLauncher.js';
 import { ShellManager } from './copilotShellTools.js';
 import { isAgentHostTelemetryService } from '../agentHostTelemetryService.js';
-import { ICopilotApiService } from '../shared/copilotApiService.js';
+import { ICopilotApiService, type IRestrictedTelemetryContext } from '../shared/copilotApiService.js';
+import { AgentHostGitHubTelemetryRouter } from '../agentHostGitHubTelemetryRouter.js';
 import { CopilotSlashCommandCompletionProvider, ICopilotRuntimeSlashCommandQueryOptions } from './copilotSlashCommandCompletionProvider.js';
 import { DiscoveredType, SessionCustomizationDiscovery, areDiscoveredDirectoriesEqual, type IDiscoveredDirectory } from './sessionCustomizationDiscovery.js';
 import { COPILOT_INTEGRATION_ID } from '../../../endpoint/common/licenseAgreement.js';
@@ -379,6 +380,7 @@ export class CopilotAgent extends Disposable implements IAgent {
 	private readonly _plugins: PluginController;
 	private readonly _sessionLauncher: CopilotSessionLauncher;
 	private readonly _gitHubTelemetryForwarder: CopilotGitHubTelemetryForwarder;
+	private readonly _githubTelemetryRouter: AgentHostGitHubTelemetryRouter | undefined;
 	readonly onDidCustomizationsChange: Event<void>;
 	/** Per-session active client state for tools + plugin snapshot tracking. */
 	private readonly _activeClients = new ResourceMap<ActiveClient>();
@@ -406,6 +408,9 @@ export class CopilotAgent extends Disposable implements IAgent {
 		this._sessionLauncher = this._instantiationService.createInstance(CopilotSessionLauncher);
 		this._gitHubTelemetryForwarder = this._instantiationService.createInstance(CopilotGitHubTelemetryForwarder, () => this._restrictedTelemetryEnabled);
 		this._slashCommandProvider = new CopilotSlashCommandProvider(() => this._ensureClient().then(c => c.rpc.commands.list().then(c => c.commands)), this._logService);
+		this._githubTelemetryRouter = isAgentHostTelemetryService(this._telemetryService)
+			? new AgentHostGitHubTelemetryRouter(this._telemetryService)
+			: undefined;
 		this.onDidCustomizationsChange = this._plugins.onDidChange;
 		// Mirror the sub-agent fan-out signals onto the first-class spawned-
 		// chat channel so the orchestrator manages sub-agent chats
@@ -656,7 +661,7 @@ export class CopilotAgent extends Disposable implements IAgent {
 		// `rt`/`tid` claims — those live in the Copilot session token, which the API service mints —
 		// so the real values are resolved asynchronously below. Mirrors how the Copilot extension
 		// reads `rt`/`tid` off its `CopilotToken` rather than the GitHub token.
-		this._applyRestrictedTelemetry(false, undefined, undefined);
+		this._applyRestrictedTelemetry(undefined);
 		if (githubToken) {
 			void this._resolveRestrictedTelemetry(githubToken);
 		}
@@ -668,17 +673,17 @@ export class CopilotAgent extends Disposable implements IAgent {
 			if (this._githubToken !== githubToken) {
 				return; // token changed while resolving; a newer call owns the state
 			}
-			this._applyRestrictedTelemetry(
-				ctx.restrictedTelemetryEnabled,
-				ctx.trackingId,
-				ctx.telemetryEndpoint ? `${ctx.telemetryEndpoint}/telemetry` : undefined,
-			);
+			this._applyRestrictedTelemetry({
+				...ctx,
+				telemetryEndpoint: ctx.telemetryEndpoint ? `${ctx.telemetryEndpoint}/telemetry` : undefined,
+			});
 		} catch (err) {
 			this._logService.debug(`[Copilot] Restricted telemetry resolution failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	}
 
-	private _applyRestrictedTelemetry(rtEnabled: boolean, trackingId: string | undefined, telemetryEndpoint: string | undefined): void {
+	private _applyRestrictedTelemetry(context: IRestrictedTelemetryContext | undefined): void {
+		const rtEnabled = context?.restrictedTelemetryEnabled === true;
 		if (rtEnabled !== this._restrictedTelemetryEnabled) {
 			this._restrictedTelemetryEnabled = rtEnabled;
 			this._logService.info(`[Copilot] Enhanced (restricted) telemetry ${rtEnabled ? 'enabled for this account' : 'disabled'}`);
@@ -689,8 +694,14 @@ export class CopilotAgent extends Disposable implements IAgent {
 		// the endpoint routes at the user's CAPI telemetry host (dotcom, GHE, or proxy).
 		if (isAgentHostTelemetryService(this._telemetryService)) {
 			this._telemetryService.setRestrictedTelemetryEnabled(rtEnabled);
-			this._telemetryService.setCopilotTrackingId(trackingId);
-			this._telemetryService.setRestrictedTelemetryEndpoint(telemetryEndpoint);
+			this._telemetryService.setCopilotTrackingId(context?.trackingId);
+			this._telemetryService.setRestrictedTelemetryEndpoint(context?.telemetryEndpoint);
+			this._telemetryService.setInternalTelemetryContext(context ? {
+				isInternal: context.isInternal === true,
+				trackingId: context.trackingId,
+				userName: context.userName,
+				isVscodeTeamMember: context.isVscodeTeamMember === true,
+			} : undefined);
 		}
 	}
 
@@ -962,7 +973,11 @@ export class CopilotAgent extends Disposable implements IAgent {
 				telemetry,
 				logLevel: copilotSdkLogLevelAtStartup,
 				enableRemoteSessions: sessionSyncAtStartup,
-				onGitHubTelemetry: (notification: GitHubTelemetryNotification) => this._gitHubTelemetryForwarder.forward(notification),
+				onGitHubTelemetry: (notification: GitHubTelemetryNotification) => {
+					if (this._githubTelemetryRouter?.route(notification) !== true) {
+						this._gitHubTelemetryForwarder.forward(notification);
+					}
+				},
 			};
 			const client = this._createCopilotClient(clientOptions);
 			await client.start();

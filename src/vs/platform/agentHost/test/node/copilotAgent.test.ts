@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import type { CopilotClient, CopilotClientOptions, CopilotSession, ModelInfo, SessionEvent, SessionEventHandler, SessionEventPayload, SessionEventType, TypedSessionEventHandler } from '@github/copilot-sdk';
+import type { CopilotClient, CopilotClientOptions, CopilotSession, GitHubTelemetryNotification, ModelInfo, SessionEvent, SessionEventHandler, SessionEventPayload, SessionEventType, TypedSessionEventHandler } from '@github/copilot-sdk';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { CCAModel } from '@vscode/copilot-api';
 import assert from 'assert';
@@ -30,6 +30,7 @@ import { IAgentHostProxyResolver } from '../../node/agentHostProxyResolver.js';
 import type { IAgentHostClientProxyConnection } from '../../common/agentHostClientProxyChannel.js';
 import { ITelemetryService } from '../../../telemetry/common/telemetry.js';
 import { NullTelemetryService } from '../../../telemetry/common/telemetryUtils.js';
+import { AgentHostTelemetryService } from '../../node/agentHostTelemetryService.js';
 import { CopilotCliConfigKey } from '../../common/copilotCliConfig.js';
 import { AgentHostPreferLongContextEnabledConfigKey } from '../../common/agentHostSchema.js';
 import { IAgentPluginManager, ISyncedCustomization } from '../../common/agentPluginManager.js';
@@ -60,7 +61,7 @@ import { SessionDatabase } from '../../node/sessionDatabase.js';
 import { createNullSessionDataService } from '../common/sessionTestHelpers.js';
 import { ActiveClientToolSet } from '../../node/activeClientState.js';
 import { ByokLmBridgeRegistry, IByokLmBridgeRegistry } from '../../node/byokLmBridgeRegistry.js';
-import { ICopilotApiService, type ICopilotApiServiceRequestOptions, type ICopilotUtilityChatCompletionRequest } from '../../node/shared/copilotApiService.js';
+import { ICopilotApiService, type ICopilotApiServiceRequestOptions, type ICopilotUtilityChatCompletionRequest, type IRestrictedTelemetryContext } from '../../node/shared/copilotApiService.js';
 
 /**
  * Test helpers for the single `_sessions` container. All chats (default + peers)
@@ -216,6 +217,7 @@ class TestCopilotApiService implements ICopilotApiService {
 	error: Error | undefined;
 	apiEndpoint: string | undefined;
 	userLogin: string | undefined;
+	readonly restrictedTelemetryContexts = new Map<string, IRestrictedTelemetryContext>();
 
 	messages(_githubToken: string, _request: Anthropic.MessageCreateParamsStreaming, _options?: ICopilotApiServiceRequestOptions): AsyncGenerator<Anthropic.MessageStreamEvent>;
 	messages(_githubToken: string, _request: Anthropic.MessageCreateParamsNonStreaming, _options?: ICopilotApiServiceRequestOptions): Promise<Anthropic.Message>;
@@ -225,7 +227,16 @@ class TestCopilotApiService implements ICopilotApiService {
 	async countTokens(): Promise<Anthropic.MessageTokensCount> { throw new Error('not used'); }
 	async models(): Promise<CCAModel[]> { return []; }
 	async responses(): Promise<Response> { throw new Error('not used'); }
-	async resolveRestrictedTelemetryContext() { return { restrictedTelemetryEnabled: false, trackingId: undefined, telemetryEndpoint: undefined }; }
+	async resolveRestrictedTelemetryContext(githubToken: string): Promise<IRestrictedTelemetryContext> {
+		return this.restrictedTelemetryContexts.get(githubToken) ?? {
+			restrictedTelemetryEnabled: false,
+			trackingId: undefined,
+			telemetryEndpoint: undefined,
+			isInternal: false,
+			userName: undefined,
+			isVscodeTeamMember: false,
+		};
+	}
 	async resolveApiEndpoint() { return this.apiEndpoint; }
 	async resolveUserLogin() { return this.userLogin; }
 	async utilityChatCompletion(githubToken: string, request: ICopilotUtilityChatCompletionRequest, options?: ICopilotApiServiceRequestOptions): Promise<string> {
@@ -470,10 +481,11 @@ class ResumePathCopilotAgent extends CopilotAgent {
 		@IAgentHostCompletions completions: IAgentHostCompletions,
 		@INativeEnvironmentService environmentService: INativeEnvironmentService,
 		@IByokLmBridgeRegistry byokBridgeRegistry: IByokLmBridgeRegistry,
+		@ITelemetryService telemetryService: ITelemetryService,
 		@IAgentHostProxyResolver proxyResolver: IAgentHostProxyResolver,
 		@ICopilotApiService copilotApiService: ICopilotApiService,
 	) {
-		super(logService, instantiationService, sessionDataService, gitService, configurationService, createTestGitHubEndpointService(), new MockAgentHostOTelService(), completions, NULL_CHECKPOINT_SERVICE, NULL_REVIEW_SERVICE, environmentService, byokBridgeRegistry, NullTelemetryService, copilotApiService, proxyResolver);
+		super(logService, instantiationService, sessionDataService, gitService, configurationService, createTestGitHubEndpointService(), new MockAgentHostOTelService(), completions, NULL_CHECKPOINT_SERVICE, NULL_REVIEW_SERVICE, environmentService, byokBridgeRegistry, telemetryService, copilotApiService, proxyResolver);
 		this._enablePlanModeOnClient(this._copilotClient as CopilotClient);
 	}
 
@@ -501,10 +513,11 @@ class TestableCopilotAgent extends CopilotAgent {
 		@IAgentHostCompletions completions: IAgentHostCompletions,
 		@INativeEnvironmentService environmentService: INativeEnvironmentService,
 		@IByokLmBridgeRegistry byokBridgeRegistry: IByokLmBridgeRegistry,
+		@ITelemetryService telemetryService: ITelemetryService,
 		@IAgentHostProxyResolver proxyResolver: IAgentHostProxyResolver,
 		@ICopilotApiService copilotApiService: ICopilotApiService,
 	) {
-		super(logService, instantiationService, sessionDataService, gitService, configurationService, createTestGitHubEndpointService(), new MockAgentHostOTelService(), completions, NULL_CHECKPOINT_SERVICE, NULL_REVIEW_SERVICE, environmentService, byokBridgeRegistry, NullTelemetryService, copilotApiService, proxyResolver);
+		super(logService, instantiationService, sessionDataService, gitService, configurationService, createTestGitHubEndpointService(), new MockAgentHostOTelService(), completions, NULL_CHECKPOINT_SERVICE, NULL_REVIEW_SERVICE, environmentService, byokBridgeRegistry, telemetryService, copilotApiService, proxyResolver);
 		this._enablePlanModeOnClient(this._copilotClient as CopilotClient);
 	}
 
@@ -556,7 +569,7 @@ function getCreatedClientOptions(agent: CopilotAgent): readonly CopilotClientOpt
 	return agent.createdClientOptions;
 }
 
-function createTestAgentContext(disposables: Pick<DisposableStore, 'add'>, options?: { sessionDataService?: ISessionDataService; copilotClient?: ITestCopilotClient; useRealResumePath?: boolean; gitService?: TestAgentHostGitService; environmentServiceRegistration?: 'native' | 'none'; pluginManager?: IAgentPluginManager; fileService?: FileService; copilotApiService?: ICopilotApiService; gitHubEndpointService?: IAgentHostGitHubEndpointService; userHome?: URI; logService?: ILogService }): { agent: CopilotAgent; instantiationService: IInstantiationService; configurationService: IAgentConfigurationService; fileService: FileService } {
+function createTestAgentContext(disposables: Pick<DisposableStore, 'add'>, options?: { sessionDataService?: ISessionDataService; copilotClient?: ITestCopilotClient; useRealResumePath?: boolean; gitService?: TestAgentHostGitService; environmentServiceRegistration?: 'native' | 'none'; pluginManager?: IAgentPluginManager; fileService?: FileService; copilotApiService?: ICopilotApiService; gitHubEndpointService?: IAgentHostGitHubEndpointService; telemetryService?: ITelemetryService; userHome?: URI; logService?: ILogService }): { agent: CopilotAgent; instantiationService: IInstantiationService; configurationService: IAgentConfigurationService; fileService: FileService } {
 	const services = new ServiceCollection();
 	const logService = options?.logService ?? new NullLogService();
 	const fileService = options?.fileService ?? disposables.add(new FileService(logService));
@@ -582,7 +595,7 @@ function createTestAgentContext(disposables: Pick<DisposableStore, 'add'>, optio
 	services.set(IByokLmBridgeRegistry, new ByokLmBridgeRegistry());
 	const copilotApiService = options?.copilotApiService ?? new TestCopilotApiService();
 	services.set(ICopilotApiService, copilotApiService);
-	services.set(ITelemetryService, NullTelemetryService);
+	services.set(ITelemetryService, options?.telemetryService ?? NullTelemetryService);
 	if (options?.environmentServiceRegistration !== 'none') {
 		const environmentService = {
 			_serviceBrand: undefined,
@@ -598,7 +611,7 @@ function createTestAgentContext(disposables: Pick<DisposableStore, 'add'>, optio
 	return { agent, instantiationService, configurationService: configService, fileService };
 }
 
-function createTestAgent(disposables: Pick<DisposableStore, 'add'>, options?: { sessionDataService?: ISessionDataService; copilotClient?: ITestCopilotClient; useRealResumePath?: boolean; gitService?: TestAgentHostGitService; environmentServiceRegistration?: 'native' | 'none'; pluginManager?: IAgentPluginManager; fileService?: FileService; copilotApiService?: ICopilotApiService; gitHubEndpointService?: IAgentHostGitHubEndpointService; userHome?: URI; logService?: ILogService }): CopilotAgent {
+function createTestAgent(disposables: Pick<DisposableStore, 'add'>, options?: { sessionDataService?: ISessionDataService; copilotClient?: ITestCopilotClient; useRealResumePath?: boolean; gitService?: TestAgentHostGitService; environmentServiceRegistration?: 'native' | 'none'; pluginManager?: IAgentPluginManager; fileService?: FileService; copilotApiService?: ICopilotApiService; gitHubEndpointService?: IAgentHostGitHubEndpointService; telemetryService?: ITelemetryService; userHome?: URI; logService?: ILogService }): CopilotAgent {
 	return createTestAgentContext(disposables, options).agent;
 }
 
@@ -667,6 +680,116 @@ async function disposeAgent(agent: CopilotAgent): Promise<void> {
 
 suite('CopilotAgent', () => {
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
+
+	test('installs the GitHub telemetry callback in CopilotClientOptions', async () => {
+		const client = new TestCopilotClient([]);
+		const agent = createTestAgent(disposables, { copilotClient: client }) as TestableCopilotAgent;
+		try {
+			await agent.listSessions();
+			assert.strictEqual(typeof getCreatedClientOptions(agent).at(-1)?.onGitHubTelemetry, 'function');
+		} finally {
+			await disposeAgent(agent);
+		}
+	});
+
+	test('routes exact legacy targets exclusively and falls back to generic forwarding', async () => {
+		const client = new TestCopilotClient([]);
+		const copilotApiService = new TestCopilotApiService();
+		copilotApiService.restrictedTelemetryContexts.set('restricted-token', {
+			restrictedTelemetryEnabled: true,
+			trackingId: 'restricted-tid',
+			telemetryEndpoint: 'https://telemetry.example',
+			isInternal: true,
+			userName: 'octocat',
+			isVscodeTeamMember: true,
+		});
+		const telemetryService = disposables.add(new class extends AgentHostTelemetryService {
+			readonly genericEvents: string[] = [];
+			readonly enhancedEvents: string[] = [];
+			readonly internalEvents: string[] = [];
+			restrictedEnabled = false;
+
+			override publicLog(eventName: string): void {
+				this.genericEvents.push(eventName);
+			}
+			override sendEnhancedGHTelemetryEvent(eventName: string): void {
+				this.enhancedEvents.push(eventName);
+			}
+			override sendInternalMSFTTelemetryEvent(eventName: string): void {
+				this.internalEvents.push(eventName);
+			}
+			override setRestrictedTelemetryEnabled(enabled: boolean): void {
+				this.restrictedEnabled = enabled;
+				super.setRestrictedTelemetryEnabled(enabled);
+			}
+		}(NullTelemetryService));
+		const agent = createTestAgent(disposables, { copilotClient: client, copilotApiService, telemetryService }) as TestableCopilotAgent;
+		try {
+			await agent.authenticate('https://api.github.com', 'restricted-token');
+			for (let i = 0; i < 100 && !telemetryService.restrictedEnabled; i++) {
+				await Promise.resolve();
+			}
+			await agent.listSessions();
+			const forward = getCreatedClientOptions(agent).at(-1)?.onGitHubTelemetry;
+			assert.ok(forward);
+
+			const notification = (kind: string, restricted: boolean): GitHubTelemetryNotification => ({
+				sessionId: 'session-1',
+				restricted,
+				event: { kind, properties: {}, metrics: {} },
+			});
+			await forward(notification('engine.messages.length', true));
+			await forward(notification('unknown_restricted', true));
+			await forward(notification('tool_call_executed', false));
+
+			assert.deepStrictEqual({
+				generic: telemetryService.genericEvents,
+				enhanced: telemetryService.enhancedEvents,
+				internal: telemetryService.internalEvents,
+			}, {
+				generic: ['copilotCli/unknown_restricted', 'copilotCli/tool_call_executed'],
+				enhanced: ['engine.messages.length'],
+				internal: ['engine.messages.length'],
+			});
+		} finally {
+			await disposeAgent(agent);
+		}
+	});
+
+	test('applies and clears internal identity on account changes', async () => {
+		const client = new TestCopilotClient([]);
+		const copilotApiService = new TestCopilotApiService();
+		copilotApiService.restrictedTelemetryContexts.set('internal-token', {
+			restrictedTelemetryEnabled: true,
+			trackingId: 'internal-tid',
+			telemetryEndpoint: 'https://telemetry.example',
+			isInternal: true,
+			userName: 'octocat',
+			isVscodeTeamMember: true,
+		});
+		const telemetryService = disposables.add(new class extends AgentHostTelemetryService {
+			readonly contexts: ({ isInternal: boolean; trackingId: string | undefined; userName: string | undefined; isVscodeTeamMember: boolean } | undefined)[] = [];
+			override setInternalTelemetryContext(context: { isInternal: boolean; trackingId: string | undefined; userName: string | undefined; isVscodeTeamMember: boolean } | undefined): void {
+				this.contexts.push(context);
+			}
+		}(NullTelemetryService));
+		const agent = createTestAgent(disposables, { copilotClient: client, copilotApiService, telemetryService });
+		try {
+			await agent.authenticate('https://api.github.com', 'internal-token');
+			for (let i = 0; i < 100 && telemetryService.contexts.length < 2; i++) {
+				await Promise.resolve();
+			}
+			await agent.authenticate('https://api.github.com', '');
+
+			assert.deepStrictEqual(telemetryService.contexts, [
+				undefined,
+				{ isInternal: true, trackingId: 'internal-tid', userName: 'octocat', isVscodeTeamMember: true },
+				undefined,
+			]);
+		} finally {
+			await disposeAgent(agent);
+		}
+	});
 
 	test('advertises Copilot as its display name', async () => {
 		const agent = createTestAgent(disposables);

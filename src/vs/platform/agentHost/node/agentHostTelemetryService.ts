@@ -23,7 +23,8 @@ import { TelemetryService } from '../../telemetry/common/telemetryService.js';
 import { getPiiPathsFromEnvironment, isInternalTelemetry, isLoggingOnly, NullTelemetryService, supportsTelemetry, type ITelemetryAppender } from '../../telemetry/common/telemetryUtils.js';
 import { AgentHostTelemetryLevelConfigKey, agentHostConfigValueToTelemetryLevel } from '../common/agentHostSchema.js';
 import { AgentHostDevDeviceIdEnvKey, AgentHostMachineIdEnvKey, AgentHostSqmIdEnvKey } from '../common/agentHostTelemetryEnv.js';
-import { AgentHostRestrictedTelemetrySender, IAgentHostRestrictedTelemetry, TelemetryMeasurements, TelemetryProps } from './agentHostRestrictedTelemetry.js';
+import { AgentHostRestrictedTelemetrySender, IAgentHostRestrictedTelemetry, IAgentHostInternalTelemetryContext, TelemetryMeasurements, TelemetryProps } from './agentHostRestrictedTelemetry.js';
+import { AgentHostInternalTelemetrySender } from './agentHostMicrosoftTelemetry.js';
 
 export interface IAgentHostTelemetryServiceOptions {
 	readonly environmentService: INativeEnvironmentService;
@@ -52,6 +53,7 @@ export class AgentHostTelemetryService extends Disposable implements IAgentHostT
 	 * keeping public users off the enhanced pipeline the way the Copilot extension does.
 	 */
 	private _restrictedTelemetryEnabled = false;
+	private _internalTelemetryEnabled = false;
 
 	constructor(
 		private readonly _delegate: ITelemetryService,
@@ -138,7 +140,7 @@ export class AgentHostTelemetryService extends Disposable implements IAgentHostT
 	}
 
 	sendInternalMSFTTelemetryEvent(eventName: string, properties?: TelemetryProps, measurements?: TelemetryMeasurements): void {
-		if (this.telemetryLevel < TelemetryLevel.USAGE) {
+		if (this.telemetryLevel < TelemetryLevel.USAGE || !this._internalTelemetryEnabled) {
 			return;
 		}
 		this._restricted?.sendInternalMSFTTelemetryEvent(eventName, properties, measurements);
@@ -157,6 +159,11 @@ export class AgentHostTelemetryService extends Disposable implements IAgentHostT
 		// Mirror onto the sender so the restricted-table writer enforces the same `rt` gate
 		// independently (defense in depth), matching the extension's opted-in-only reporter.
 		this._restricted?.setRestrictedTelemetryEnabled(enabled);
+	}
+
+	setInternalTelemetryContext(context: IAgentHostInternalTelemetryContext | undefined): void {
+		this._internalTelemetryEnabled = context?.isInternal === true;
+		this._restricted?.setInternalTelemetryContext(context);
 	}
 
 	setExperimentProperty(name: string, value: string): void {
@@ -223,7 +230,8 @@ export async function createAgentHostTelemetryService(options: IAgentHostTelemet
 		piiPaths: getPiiPathsFromEnvironment(environmentService),
 	}, configurationService, productService);
 
-	const restricted = new AgentHostRestrictedTelemetrySender(commonProperties, logService, undefined, undefined, options.fetchFn);
+	const internalSender = disposables.add(new AgentHostInternalTelemetrySender(options.requestService));
+	const restricted = new AgentHostRestrictedTelemetrySender(commonProperties, logService, undefined, internalSender, options.fetchFn);
 
 	return disposables.add(new AgentHostTelemetryService(telemetryService, restricted));
 }

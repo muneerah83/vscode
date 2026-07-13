@@ -7,7 +7,7 @@ import assert from 'assert';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../log/common/log.js';
 import { ICommonProperties } from '../../../telemetry/common/telemetry.js';
-import { AgentHostRestrictedTelemetrySender } from '../../node/agentHostRestrictedTelemetry.js';
+import { AgentHostRestrictedTelemetrySender, type IAgentHostInternalTelemetryContext, type IAgentHostInternalTelemetrySink, type TelemetryMeasurements, type TelemetryProps } from '../../node/agentHostRestrictedTelemetry.js';
 
 /** The enhanced/restricted iKey (`copilot_v0_restricted_copilot_event`). */
 const GH_ENHANCED_IKEY = '3fdd7f28-937a-48c8-9a21-ba337db23bd1';
@@ -15,6 +15,18 @@ const GH_ENHANCED_IKEY = '3fdd7f28-937a-48c8-9a21-ba337db23bd1';
 interface ICapturedPost {
 	url: string;
 	iKey: string;
+}
+
+class TestInternalSink implements IAgentHostInternalTelemetrySink {
+	readonly contexts: (IAgentHostInternalTelemetryContext | undefined)[] = [];
+	readonly events: { eventName: string; properties: TelemetryProps | undefined; measurements: TelemetryMeasurements | undefined }[] = [];
+
+	setContext(context: IAgentHostInternalTelemetryContext | undefined): void {
+		this.contexts.push(context);
+	}
+	send(eventName: string, properties?: TelemetryProps, measurements?: TelemetryMeasurements): void {
+		this.events.push({ eventName, properties, measurements });
+	}
 }
 
 suite('AgentHostRestrictedTelemetrySender', () => {
@@ -48,5 +60,28 @@ suite('AgentHostRestrictedTelemetrySender', () => {
 		sender.sendEnhancedGHTelemetryEvent('request.options.tools', { messagesJson: 'x' });
 
 		assert.deepStrictEqual(posts, [{ url: 'https://ghe.example', iKey: GH_ENHANCED_IKEY }]);
+	});
+
+	test('internal telemetry is independently gated on internal identity', () => {
+		const internalSink = new TestInternalSink();
+		const sender = new AgentHostRestrictedTelemetrySender(commonProperties, new NullLogService(), 'https://default.example/telemetry', internalSink);
+
+		sender.sendInternalMSFTTelemetryEvent('beforeIdentity');
+		sender.setInternalTelemetryContext({ isInternal: false, trackingId: 'external', userName: 'external', isVscodeTeamMember: false });
+		sender.sendInternalMSFTTelemetryEvent('external');
+		const internalContext = { isInternal: true, trackingId: 'internal', userName: 'octocat', isVscodeTeamMember: true };
+		sender.setInternalTelemetryContext(internalContext);
+		sender.sendInternalMSFTTelemetryEvent('internal', { value: 'property' }, { count: 1 });
+		sender.setInternalTelemetryContext(undefined);
+		sender.sendInternalMSFTTelemetryEvent('afterClear');
+
+		assert.deepStrictEqual({ contexts: internalSink.contexts, events: internalSink.events }, {
+			contexts: [
+				{ isInternal: false, trackingId: 'external', userName: 'external', isVscodeTeamMember: false },
+				internalContext,
+				undefined,
+			],
+			events: [{ eventName: 'internal', properties: { value: 'property' }, measurements: { count: 1 } }],
+		});
 	});
 });
