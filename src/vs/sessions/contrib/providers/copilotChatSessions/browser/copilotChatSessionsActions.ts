@@ -17,7 +17,7 @@ import { Menus } from '../../../../browser/menus.js';
 import { SessionHasGitRepositoryContext, SessionProviderIdContext, SessionTypeContext, IsNewChatSessionContext } from '../../../../common/contextkeys.js';
 import { ISessionsProvidersService } from '../../../../services/sessions/browser/sessionsProvidersService.js';
 import { ISessionsService } from '../../../../services/sessions/browser/sessionsService.js';
-import { BranchPicker, IBranchPickerModel } from './branchPicker.js';
+import { BranchPicker, IBranchPickerModel } from '../../../chat/browser/branchPicker.js';
 import { ClaudePermissionModePicker } from './claudePermissionModePicker.js';
 import { ClaudeCodeSessionType, COPILOT_PROVIDER_ID, CopilotChatSessionsProvider } from './copilotChatSessionsProvider.js';
 import { LocalSessionType } from '../../localChatSessions/browser/localChatSessionsProvider.js';
