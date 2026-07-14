@@ -3270,6 +3270,21 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 		return { state: realState, hideConfirmationDetail: false };
 	}
 
+	/**
+	 * Translate the internal `waiting_for_confirmation` state to the wire value
+	 * the backend expects. Approvals (yes/no) stay `waiting_for_confirmation`;
+	 * items needing a spoken/typed answer (questions, plan review, elicitation)
+	 * become `waiting_for_input` so the backend reads the question and accepts an
+	 * answer instead of prompting for confirmation. All internal timing/deferral
+	 * logic keeps using `waiting_for_confirmation`; only the emitted value differs.
+	 */
+	private _wireAgentState(reportedState: string, pendingKind: 'input' | 'approval' | undefined): string {
+		if (reportedState === 'waiting_for_confirmation' && pendingKind === 'input') {
+			return 'waiting_for_input';
+		}
+		return reportedState;
+	}
+
 	private _buildSessionContext(): IVoiceSessionContext {
 		const oneHourAgo = Date.now() - 60 * 60 * 1000;
 		const sessions = this.agentSessionsService.model.sessions.filter(s => {
@@ -3351,7 +3366,7 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 			return {
 				id: s.resource.toString(),
 				is_active: isActive,
-				agent_state: scoped.state,
+				agent_state: this._wireAgentState(scoped.state, stateInfo.pendingKind),
 				...(!scoped.hideConfirmationDetail && stateInfo.detail ? { agent_state_detail: stateInfo.detail } : {}),
 				...(shipSummary ? { last_response_summary: shipSummary } : {}),
 			};
@@ -3375,7 +3390,7 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 			sessionList.push({
 				id: key,
 				is_active: isActive,
-				agent_state: scoped.state,
+				agent_state: this._wireAgentState(scoped.state, stateInfo.pendingKind),
 				...(!scoped.hideConfirmationDetail && stateInfo.detail ? { agent_state_detail: stateInfo.detail } : {}),
 				...(stateInfo.last_response_summary ? { last_response_summary: stateInfo.last_response_summary } : {}),
 			});
@@ -3508,7 +3523,7 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 		return stateInfo.state;
 	}
 
-	private _getAgentStateInfo(model: IChatModel | undefined | null): { state: string; detail?: string; last_response_summary?: string } {
+	private _getAgentStateInfo(model: IChatModel | undefined | null): { state: string; detail?: string; last_response_summary?: string; pendingKind?: 'input' | 'approval' } {
 		if (!model) {
 			return { state: 'unknown' };
 		}
@@ -3522,6 +3537,9 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 			// so earlier tools (already confirmed) will have left
 			// WaitingForConfirmation while the newest pending item is last.
 			let confirmDetail = '';
+			// Track whether the pending item needs a spoken/typed answer ('input',
+			// e.g. questions/plan review/elicitation) vs a yes/no approval; last match wins.
+			let pendingKind: 'input' | 'approval' | undefined;
 			for (const part of lastRequest?.response?.response.value ?? []) {
 				if (part.kind === 'questionCarousel' && !(part as { isUsed?: boolean }).isUsed) {
 					const carousel = part as { questions?: { title?: string }[]; message?: string | { value: string } };
@@ -3532,17 +3550,21 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 						const msg = carousel.message;
 						confirmDetail = msg ? (typeof msg === 'string' ? msg : msg.value) : 'asking clarifying questions';
 					}
+					pendingKind = 'input';
 				} else if (part.kind === 'planReview' && !(part as { isUsed?: boolean }).isUsed) {
 					confirmDetail = 'review the plan to continue';
+					pendingKind = 'input';
 				} else if (part.kind === 'elicitation2') {
 					const elicitation = part as { state: IObservable<string>; title?: string | { value: string } };
 					if (elicitation.state.get() === 'pending') {
 						const title = elicitation.title;
 						confirmDetail = title ? (typeof title === 'string' ? title : title.value) : 'needs input';
+						pendingKind = 'input';
 					}
 				} else if (part.kind === 'confirmation' && !(part as { isUsed?: boolean }).isUsed) {
 					const conf = part as { title?: string };
 					confirmDetail = conf.title ?? 'needs approval';
+					pendingKind = 'approval';
 				} else if (part.kind === 'toolInvocation') {
 					const state = part.state.get();
 					if (state.type === IChatToolInvocation.StateKind.WaitingForConfirmation) {
@@ -3557,6 +3579,7 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 						} else {
 							confirmDetail = pendingConfirmation.detail ?? '';
 						}
+						pendingKind = 'approval';
 					}
 				}
 			}
@@ -3564,6 +3587,7 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 			return {
 				state: 'waiting_for_confirmation',
 				detail: confirmDetail || pendingConfirmation.detail || '',
+				...(pendingKind ? { pendingKind } : {}),
 			};
 		}
 
@@ -3572,6 +3596,7 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 		// undefined. Scan response parts directly to catch these.
 		if (lastRequest?.response) {
 			let fallbackDetail: string | undefined;
+			let fallbackKind: 'input' | 'approval' | undefined;
 			for (const part of lastRequest.response.response.value) {
 				if (part.kind === 'toolInvocation') {
 					const state = part.state.get();
@@ -3585,6 +3610,8 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 								.filter(Boolean)
 								.join(', ');
 							detail = headers ? `questions: ${headers}` : 'asking clarifying questions';
+							// Questions need a spoken answer, not a yes/no approval.
+							fallbackKind = 'input';
 						}
 						if (!detail) {
 							const invMsg = (part as { invocationMessage?: string | { value: string } }).invocationMessage;
@@ -3598,6 +3625,7 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 				return {
 					state: 'waiting_for_confirmation',
 					detail: fallbackDetail,
+					...(fallbackKind ? { pendingKind: fallbackKind } : {}),
 				};
 			}
 		}
