@@ -1851,6 +1851,11 @@ interface CapturedRequest {
 interface StartServerOptions {
 	logger?: (msg: string) => void;
 	verbose?: boolean;
+	/** Reject requests that do not carry this exact header. */
+	requiredRequestHeader?: {
+		name: string;
+		value: string;
+	};
 	/**
 	 * When `true`, the server retains the parsed body of every `/chat/completions`
 	 * and `/responses` POST so tests can assert what the client forwarded (see
@@ -1904,6 +1909,12 @@ function _startServer(port = 0, options?: StartServerOptions): Promise<MockLlmSe
 		}
 
 		const server = http.createServer((req, res) => {
+			const requiredRequestHeader = options?.requiredRequestHeader;
+			if (requiredRequestHeader && req.headers[requiredRequestHeader.name.toLowerCase()] !== requiredRequestHeader.value) {
+				res.writeHead(403);
+				res.end('Request must use the configured test proxy');
+				return;
+			}
 			reqCount++;
 			requestWaiters = requestWaiters.filter(fn => !fn());
 			handleRequest(req, res);
